@@ -1,1 +1,1 @@
-# vfred-rvv-ai
+# RISC-V Vector Floating-point Adder for AI
