@@ -78,8 +78,10 @@ class VFRedCore(
     fadd_extSig_fp19.io.b.sign := sign_in_16(2*i+1)
     fadd_extSig_fp19.io.b.exp := exp_adjust_subnorm_16(2*i+1)
     fadd_extSig_fp19.io.b.sig := sig_adjust_subnorm_16(2*i+1) ## 0.U(ExtendedWidthFp19.W)
-    fadd_extSig_fp19.io.a_is_inf := is_inf_16(2*i)
-    fadd_extSig_fp19.io.b_is_inf := is_inf_16(2*i+1)
+    fadd_extSig_fp19.io.a_is_posInf := is_inf_16(2*i) && !sign_in_16(2*i)
+    fadd_extSig_fp19.io.b_is_posInf := is_inf_16(2*i+1) && !sign_in_16(2*i+1)
+    fadd_extSig_fp19.io.a_is_negInf := is_inf_16(2*i) && sign_in_16(2*i)
+    fadd_extSig_fp19.io.b_is_negInf := is_inf_16(2*i+1) && sign_in_16(2*i+1)
     fadd_extSig_fp19.io.a_is_nan := is_nan_16(2*i)
     fadd_extSig_fp19.io.b_is_nan := is_nan_16(2*i+1)
 
@@ -115,10 +117,13 @@ class VFRedCore(
   //--------------------------------------------
   // Inputs of the 1st layer of fp32 adder tree
   //--------------------------------------------
+  class InfoFPSpecial extends Bundle {
+    val is_posInf = Bool()
+    val is_negInf = Bool()
+    val is_nan = Bool()
+  }
   val fp32_adderTree_in = Wire(Vec(N, new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32)))
-  val fp32_adderTree_in_is_posInf = Wire(Vec(N, Bool()))
-  val fp32_adderTree_in_is_negInf = Wire(Vec(N, Bool()))
-  val fp32_adderTree_in_is_nan = Wire(Vec(N, Bool()))
+  val fp32_adderTree_in_info = Wire(Vec(N, new InfoFPSpecial()))
   val fp32_adderTree_in_valid = Wire(Bool())
 
   val SigWidth_fp19_res = SigWidthFp19 + ExtendedWidthFp19 + 1
@@ -134,9 +139,9 @@ class VFRedCore(
 
   fp32_adderTree_in_valid := fp19_res_valid || io.valid_in
   for (i <- 0 until N) {
-    fp32_adderTree_in_is_posInf(i) := Mux(fp19_res_valid, fp19_res_is_posInf(i), is_inf_32(i) && !sign_in_32(i))
-    fp32_adderTree_in_is_negInf(i) := Mux(fp19_res_valid, fp19_res_is_negInf(i), is_inf_32(i) && sign_in_32(i))
-    fp32_adderTree_in_is_nan(i) := Mux(fp19_res_valid, fp19_res_is_nan(i), is_nan_32(i))
+    fp32_adderTree_in_info(i).is_posInf := Mux(fp19_res_valid, fp19_res_is_posInf(i), is_inf_32(i) && !sign_in_32(i))
+    fp32_adderTree_in_info(i).is_negInf := Mux(fp19_res_valid, fp19_res_is_negInf(i), is_inf_32(i) && sign_in_32(i))
+    fp32_adderTree_in_info(i).is_nan := Mux(fp19_res_valid, fp19_res_is_nan(i), is_nan_32(i))
     fp32_adderTree_in(i).sign := Mux(fp19_res_valid, fp19_res(i).sign, sign_in_32(i))
     fp32_adderTree_in(i).exp := Mux(fp19_res_valid, fp19_res(i).exp, exp_adjust_subnorm_32(i))
     fp32_adderTree_in(i).sig := Mux(fp19_res_valid, fp19_res_sig_19to32(i), sig_adjust_subnorm_32(i))
@@ -145,59 +150,57 @@ class VFRedCore(
   //----------------------------
   // One layer of adder tree
   //----------------------------
-  def oneAdderTreeLayer(data: Seq[FpExtFormat], is_posInf: Seq[Bool], is_negInf: Seq[Bool], is_nan: Seq[Bool], valid: Bool):
-                       (Seq[FpExtFormat], Seq[Bool], Seq[Bool], Seq[Bool], Bool) = {
+  def oneAdderTreeLayer(data: Seq[FpExtFormat], info: Seq[InfoFPSpecial], valid: Bool):
+                       (Seq[FpExtFormat], Seq[InfoFPSpecial], Bool) = {
     val n = data.size
-    require(n == is_posInf.size && n == is_negInf.size && n == is_nan.size, "data, is_posInf, is_negInf, and is_nan must have the same size")
+    require(n == info.size, "data and info must have the same size")
     val adders = Seq.fill(n/2)(Module(new FAdd_extSig(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32,
                                                       ExtAreZeros = false, UseShiftRightJam = false)))
     val data_out = Reg(Vec(n/2, new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32)))
-    val is_posInf_out = Reg(Vec(n/2, Bool()))
-    val is_negInf_out = Reg(Vec(n/2, Bool()))
-    val is_nan_out = Reg(Vec(n/2, Bool()))
+    val info_out = Reg(Vec(n/2, new InfoFPSpecial()))
     val valid_out = Reg(Bool())
     for (i <- 0 until n/2) {
       adders(i).io.valid_in := valid
       adders(i).io.is_fp16 := false.B
-      adders(i).io.a.sign := Mux(is_posInf(2*i), false.B, Mux(is_negInf(2*i), true.B, data(2*i).sign))
+      adders(i).io.a.sign := data(2*i).sign
       adders(i).io.a.exp := data(2*i).exp
       adders(i).io.a.sig := data(2*i).sig
-      adders(i).io.b.sign := Mux(is_posInf(2*i+1), false.B, Mux(is_negInf(2*i+1), true.B, data(2*i+1).sign))
+      adders(i).io.b.sign := data(2*i+1).sign
       adders(i).io.b.exp := data(2*i+1).exp
       adders(i).io.b.sig := data(2*i+1).sig
-      adders(i).io.a_is_inf := is_posInf(2*i) || is_negInf(2*i)
-      adders(i).io.b_is_inf := is_posInf(2*i+1) || is_negInf(2*i+1)
-      adders(i).io.a_is_nan := is_nan(2*i)
-      adders(i).io.b_is_nan := is_nan(2*i+1)
+      adders(i).io.a_is_posInf := info(2*i).is_posInf
+      adders(i).io.a_is_negInf := info(2*i).is_negInf
+      adders(i).io.b_is_posInf := info(2*i+1).is_posInf
+      adders(i).io.b_is_negInf := info(2*i+1).is_negInf
+      adders(i).io.a_is_nan := info(2*i).is_nan
+      adders(i).io.b_is_nan := info(2*i+1).is_nan
 
       data_out(i).sign := RegEnable(adders(i).io.res.sign, adders(i).io.valid_out)
       data_out(i).exp := RegEnable(adders(i).io.res.exp, adders(i).io.valid_out)
       data_out(i).sig := RegEnable(adders(i).io.res.sig(SigWidthFp32 + ExtendedWidthFp32, 1), adders(i).io.valid_out)
-      is_posInf_out(i) := RegEnable(adders(i).io.res_is_posInf, adders(i).io.valid_out)
-      is_negInf_out(i) := RegEnable(adders(i).io.res_is_negInf, adders(i).io.valid_out)
-      is_nan_out(i) := RegEnable(adders(i).io.res_is_nan, adders(i).io.valid_out)
+      info_out(i).is_posInf := RegEnable(adders(i).io.res_is_posInf, adders(i).io.valid_out)
+      info_out(i).is_negInf := RegEnable(adders(i).io.res_is_negInf, adders(i).io.valid_out)
+      info_out(i).is_nan := RegEnable(adders(i).io.res_is_nan, adders(i).io.valid_out)
       if (i == 0) { valid_out := RegNext(adders(i).io.valid_out) }
     }
 
-    (data_out, is_posInf_out, is_negInf_out, is_nan_out, valid_out)
+    (data_out, info_out, valid_out)
   }
 
   //---------------------------------
   // Construct the entire adder tree
   //---------------------------------
-  def adderTreeGen(layerIdx: Int): (Seq[FpExtFormat], Seq[Bool], Seq[Bool], Seq[Bool], Bool) = {
+  def adderTreeGen(layerIdx: Int): (Seq[FpExtFormat], Seq[InfoFPSpecial], Bool) = {
     layerIdx match {
-      case 0 => oneAdderTreeLayer(fp32_adderTree_in, fp32_adderTree_in_is_posInf, fp32_adderTree_in_is_negInf,
-                                  fp32_adderTree_in_is_nan, fp32_adderTree_in_valid)
+      case 0 => oneAdderTreeLayer(fp32_adderTree_in, fp32_adderTree_in_info, fp32_adderTree_in_valid) 
       case k => {
-        val (dataPrev, posInfPrev, negInfPrev, nanPrev, validPrev) = adderTreeGen(k - 1)
-        oneAdderTreeLayer(dataPrev, posInfPrev, negInfPrev, nanPrev, validPrev)
+        val (dataPrev, infoPrev, validPrev) = adderTreeGen(k - 1)
+        oneAdderTreeLayer(dataPrev, infoPrev, validPrev)
       }
     }
   }
   
-  val (fp32_adderTree_out, fp32_adderTree_out_is_posInf, fp32_adderTree_out_is_negInf,
-       fp32_adderTree_out_is_nan, fp32_adderTree_out_valid) = adderTreeGen(log2Ceil(N) - 1)
+  val (fp32_adderTree_out, fp32_adderTree_out_info, fp32_adderTree_out_valid) = adderTreeGen(log2Ceil(N) - 1)
 
   //---------------------------------
   // Output the final result (already registered)
@@ -205,8 +208,13 @@ class VFRedCore(
   io.res.sign := fp32_adderTree_out(0).sign
   io.res.exp := fp32_adderTree_out(0).exp
   io.res.sig := fp32_adderTree_out(0).sig
-  io.res_is_posInf := fp32_adderTree_out_is_posInf(0)
-  io.res_is_negInf := fp32_adderTree_out_is_negInf(0)
-  io.res_is_nan := fp32_adderTree_out_is_nan(0)
+  io.res_is_posInf := fp32_adderTree_out_info(0).is_posInf
+  io.res_is_negInf := fp32_adderTree_out_info(0).is_negInf
+  io.res_is_nan := fp32_adderTree_out_info(0).is_nan
   io.valid_out := fp32_adderTree_out_valid
+}
+
+object VerilogVFRedCore extends App {
+  println("Generating the VFRedCore hardware")
+  emitVerilog(new VFRedCore(N = 4), Array("--target-dir", "build/verilog_vfred_core"))
 }
