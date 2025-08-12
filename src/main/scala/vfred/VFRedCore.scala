@@ -1,14 +1,45 @@
 /**
   * Vector FP Reduction Core
   *   Input: N * FP32 or 2N * BF(FP)16
-  *   Output: one FP32
+  *   Output: one FP32 (SUM or MIN/MAX)
+  * 
+  *   Note: for bf/fp16 min/max, the output resides in the upper 16 bits of the 32-bit result
+  * 
+  * Pipeline:   |      |              |      | 
+  *        ---->|----->|--- ... ----->|----->|
+  *         S0  |  S1  |              |S(D-1)|
+  *   For min/max, if N == 4^k,     D = log4(N) + {if (fp32) 0 else 1}
+  *                if N == 4^k * 2, D = log4(N/2) + 1 + {if (fp32) 0 else 1}
+  *   For sum, D = 2 * ( log2(N) + {if (fp32) 0 else 1} )
   */
-
 package race.vpu.exu.laneexu.fp
 
 import chisel3._
 import chisel3.util._
 import race.vpu._
+
+object MinMaxFP {
+  def apply(a: UInt, b: UInt, isMax: Bool): UInt = {
+    val len = a.getWidth
+    require(len == b.getWidth, "a and b must have the same width")
+    val sign_a = a.head(1).asBool
+    val sign_b = b.head(1).asBool
+    val body_a = a.tail(1)
+    val body_b = b.tail(1)
+    val body_a_gt_b = body_a > body_b
+    val res = Wire(UInt(len.W))
+    when (sign_a =/= sign_b) {
+      res := Mux(sign_a && isMax || !sign_a && !isMax, b, a)
+    }.otherwise {
+      when (body_a_gt_b) {
+        res := Mux(!sign_a && isMax || sign_a && !isMax, a, b)
+      }.otherwise {
+        res := Mux(!sign_a && isMax || sign_a && !isMax, b, a)
+      }
+    }
+    res
+  }
+}
 
 class VFRedCore(
   N: Int = 64 // N = VLEN / 32
@@ -20,10 +51,13 @@ class VFRedCore(
   val io = IO(new Bundle {
     val valid_in = Input(Bool())
     val is_bf16, is_fp16, is_fp32 = Input(Bool())
+    val is_sum, is_max, is_min = Input(Bool())
     val vs2 = Input(Vec(N, UInt(32.W)))
-    val res = Output(new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32))
-    val res_is_posInf, res_is_negInf, res_is_nan = Output(Bool())
-    val valid_out = Output(Bool())
+    val resSum = Output(new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32))
+    val resSum_is_posInf, resSum_is_negInf, resSum_is_nan = Output(Bool())
+    val valid_out_Sum = Output(Bool())
+    val resMinMax = Output(UInt(32.W))
+    val valid_out_MinMax = Output(Bool())
   })
 
   require(N > 1 && (N & (N - 1)) == 0, s"N must be a power of 2, but got $N")
@@ -63,14 +97,14 @@ class VFRedCore(
   // If input is bf/fp16, perform pairwise additions to get N fp19 results first.
   // Extra delay: 2 cycles
   //------------------------------------------------------------------------------
-  val fp19_res = Reg(Vec(N, new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp19, ExtendedWidth = ExtendedWidthFp19 + 1)))
-  val fp19_res_is_posInf = Reg(Vec(N, Bool()))
-  val fp19_res_is_negInf = Reg(Vec(N, Bool()))
-  val fp19_res_is_nan = Reg(Vec(N, Bool()))
-  val fp19_res_valid = Reg(Bool())
+  val fp19_res = Wire(Vec(N, new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp19, ExtendedWidth = ExtendedWidthFp19 + 1)))
+  val fp19_res_is_posInf = Wire(Vec(N, Bool()))
+  val fp19_res_is_negInf = Wire(Vec(N, Bool()))
+  val fp19_res_is_nan = Wire(Vec(N, Bool()))
+  val fp19_res_valid = Wire(Bool())
   for (i <- 0 until N) {
     val fadd_extSig_fp19 = Module(new FAdd_extSig(ExpWidth = 8, SigWidth = SigWidthFp19, ExtendedWidth = ExtendedWidthFp19, ExtAreZeros = true, UseShiftRightJam = false))
-    fadd_extSig_fp19.io.valid_in := io.valid_in && is_16
+    fadd_extSig_fp19.io.valid_in := io.valid_in && is_16 && io.is_sum
     fadd_extSig_fp19.io.is_fp16 := is_fp16
     fadd_extSig_fp19.io.a.sign := sign_in_16(2*i)
     fadd_extSig_fp19.io.a.exp := exp_adjust_subnorm_16(2*i)
@@ -137,7 +171,7 @@ class VFRedCore(
     }
   }
 
-  fp32_adderTree_in_valid := fp19_res_valid || io.valid_in
+  fp32_adderTree_in_valid := fp19_res_valid || io.valid_in && io.is_sum
   for (i <- 0 until N) {
     fp32_adderTree_in_info(i).is_posInf := Mux(fp19_res_valid, fp19_res_is_posInf(i), is_inf_32(i) && !sign_in_32(i))
     fp32_adderTree_in_info(i).is_negInf := Mux(fp19_res_valid, fp19_res_is_negInf(i), is_inf_32(i) && sign_in_32(i))
@@ -203,18 +237,78 @@ class VFRedCore(
   val (fp32_adderTree_out, fp32_adderTree_out_info, fp32_adderTree_out_valid) = adderTreeGen(log2Ceil(N) - 1)
 
   //---------------------------------
-  // Output the final result (already registered)
+  // Output the final SUM result (already registered)
   //---------------------------------
-  io.res.sign := fp32_adderTree_out(0).sign
-  io.res.exp := fp32_adderTree_out(0).exp
-  io.res.sig := fp32_adderTree_out(0).sig
-  io.res_is_posInf := fp32_adderTree_out_info(0).is_posInf
-  io.res_is_negInf := fp32_adderTree_out_info(0).is_negInf
-  io.res_is_nan := fp32_adderTree_out_info(0).is_nan
-  io.valid_out := fp32_adderTree_out_valid
+  io.resSum.sign := fp32_adderTree_out(0).sign
+  io.resSum.exp := fp32_adderTree_out(0).exp
+  io.resSum.sig := fp32_adderTree_out(0).sig
+  io.resSum_is_posInf := fp32_adderTree_out_info(0).is_posInf
+  io.resSum_is_negInf := fp32_adderTree_out_info(0).is_negInf
+  io.resSum_is_nan := fp32_adderTree_out_info(0).is_nan
+  io.valid_out_Sum := fp32_adderTree_out_valid
+
+  //----------------------------------
+  //  Min/Max Tree
+  //----------------------------------
+  // If input is bf/fp16, perform pairwise min/max to get N 16-bit results first.
+  val f16_resMinMax = Wire(Vec(N, UInt(16.W)))
+  val valid_in_minMax = io.valid_in && (io.is_min || io.is_max)
+  for (i <- 0 until N) {
+    f16_resMinMax(i) := RegEnable(MinMaxFP(vs2_16(2*i), vs2_16(2*i+1), io.is_max), valid_in_minMax)
+  }
+  val f16_resMinMax_valid = RegNext(valid_in_minMax)
+  val f16_resMinMax_is_max = RegEnable(io.is_max, valid_in_minMax)
+
+  // Inputs of the 1st layer of fp32 min/max tree
+  val fp32_minMaxTree_in_valid = f16_resMinMax_valid || valid_in_minMax
+  val fp32_minMaxTree_in_is_max = Mux(f16_resMinMax_valid, f16_resMinMax_is_max, io.is_max)
+  val fp32_minMaxTree_in = Wire(Vec(N, UInt(32.W)))
+  for (i <- 0 until N) {
+    fp32_minMaxTree_in(i) := Mux(f16_resMinMax_valid, f16_resMinMax(i) ## 0.U(16.W), io.vs2(i))
+  }
+  
+  // One layer of 2 -> 1 min/max tree (2 -> 1)
+  def oneMinMaxTreeLayer2to1(data: Seq[UInt], valid: Bool, is_max: Bool): (Seq[UInt], Bool, Bool) = {
+    val n = data.size
+    val data_out = Wire(Vec(n/2, UInt(32.W)))
+    for (i <- 0 until n/2) {
+      data_out(i) := RegEnable(MinMaxFP(data(2*i), data(2*i+1), is_max), valid)
+    }
+    (data_out, RegNext(valid), RegNext(is_max))
+  }
+  // One layer of 4 -> 1 min/max tree
+  def oneMinMaxTreeLayer4to1(data: Seq[UInt], valid: Bool, is_max: Bool): (Seq[UInt], Bool, Bool) = {
+    val n = data.size
+    val data_out_4to2 = Wire(Vec(n/2, UInt(32.W)))
+    for (i <- 0 until n/2) {
+      data_out_4to2(i) := MinMaxFP(data(2*i), data(2*i+1), is_max)
+    }
+    oneMinMaxTreeLayer2to1(data_out_4to2, valid, is_max)
+  }
+
+  //---- Min/Max Tree of FP32. If n == 4^k,     all use 4 -> 1 layers.
+  //                           If n == 4^k * 2, the last layer use 2 -> 1 reduction.
+  def minMaxTreeGen(layerIdx: Int): (Seq[UInt], Bool, Bool) = {
+    layerIdx match {
+      case 0 => oneMinMaxTreeLayer2to1(fp32_minMaxTree_in, fp32_minMaxTree_in_valid, fp32_minMaxTree_in_is_max)
+      case 1 => oneMinMaxTreeLayer4to1(fp32_minMaxTree_in, fp32_minMaxTree_in_valid, fp32_minMaxTree_in_is_max)
+      case k => {
+        val (dataPrev, validPrev, isMaxPrev) = minMaxTreeGen(k - 2)
+        oneMinMaxTreeLayer4to1(dataPrev, validPrev, isMaxPrev)
+      }
+    }
+  }
+
+  val (fp32_minMaxTree_out, fp32_minMaxTree_out_valid, fp32_minMaxTree_out_is_max) = minMaxTreeGen(log2Ceil(N) - 1)
+
+  //---------------------------------
+  // Output the final MIN/MAX result (already registered)
+  //---------------------------------
+  io.resMinMax := fp32_minMaxTree_out(0)
+  io.valid_out_MinMax := fp32_minMaxTree_out_valid
 }
 
 object VerilogVFRedCore extends App {
   println("Generating the VFRedCore hardware")
-  emitVerilog(new VFRedCore(N = 4), Array("--target-dir", "build/verilog_vfred_core"))
+  emitVerilog(new VFRedCore(N = 64), Array("--target-dir", "build/verilog_vfred_core"))
 }
