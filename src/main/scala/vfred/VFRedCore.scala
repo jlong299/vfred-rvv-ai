@@ -123,7 +123,7 @@ class VFRedCore(
     fp19_res_is_posInf(i) := RegEnable(fadd_extSig_fp19.io.res_is_posInf, fadd_extSig_fp19.io.valid_out)
     fp19_res_is_negInf(i) := RegEnable(fadd_extSig_fp19.io.res_is_negInf, fadd_extSig_fp19.io.valid_out)
     fp19_res_is_nan(i) := RegEnable(fadd_extSig_fp19.io.res_is_nan, fadd_extSig_fp19.io.valid_out)
-    if (i == 0) { fp19_res_valid := RegNext(fadd_extSig_fp19.io.valid_out) }
+    if (i == 0) { fp19_res_valid := RegNext(fadd_extSig_fp19.io.valid_out, init = false.B) }
   }
 
   //----------------------------------------------------------------------------------
@@ -190,9 +190,8 @@ class VFRedCore(
     require(n == info.size, "data and info must have the same size")
     val adders = Seq.fill(n/2)(Module(new FAdd_extSig(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32,
                                                       ExtAreZeros = false, UseShiftRightJam = false)))
-    val data_out = Reg(Vec(n/2, new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32)))
-    val info_out = Reg(Vec(n/2, new InfoFPSpecial()))
-    val valid_out = Reg(Bool())
+    val data_out = Wire(Vec(n/2, new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32)))
+    val info_out = Wire(Vec(n/2, new InfoFPSpecial()))
     for (i <- 0 until n/2) {
       adders(i).io.valid_in := valid
       adders(i).io.is_fp16 := false.B
@@ -215,8 +214,8 @@ class VFRedCore(
       info_out(i).is_posInf := RegEnable(adders(i).io.res_is_posInf, adders(i).io.valid_out)
       info_out(i).is_negInf := RegEnable(adders(i).io.res_is_negInf, adders(i).io.valid_out)
       info_out(i).is_nan := RegEnable(adders(i).io.res_is_nan, adders(i).io.valid_out)
-      if (i == 0) { valid_out := RegNext(adders(i).io.valid_out) }
     }
+    val valid_out = RegNext(adders(0).io.valid_out, init = false.B)
 
     (data_out, info_out, valid_out)
   }
@@ -256,7 +255,7 @@ class VFRedCore(
   for (i <- 0 until N) {
     f16_resMinMax(i) := RegEnable(MinMaxFP(vs2_16(2*i), vs2_16(2*i+1), io.is_max), valid_in_minMax)
   }
-  val f16_resMinMax_valid = RegNext(valid_in_minMax)
+  val f16_resMinMax_valid = RegNext(valid_in_minMax, init = false.B)
   val f16_resMinMax_is_max = RegEnable(io.is_max, valid_in_minMax)
 
   // Inputs of the 1st layer of fp32 min/max tree
@@ -274,7 +273,7 @@ class VFRedCore(
     for (i <- 0 until n/2) {
       data_out(i) := RegEnable(MinMaxFP(data(2*i), data(2*i+1), is_max), valid)
     }
-    (data_out, RegNext(valid), RegNext(is_max))
+    (data_out, RegNext(valid, init = false.B), RegEnable(is_max, valid))
   }
   // One layer of 4 -> 1 min/max tree
   def oneMinMaxTreeLayer4to1(data: Seq[UInt], valid: Bool, is_max: Bool): (Seq[UInt], Bool, Bool) = {
