@@ -12,11 +12,12 @@
   *                if N == 4^k * 2, D = log4(N/2) + 1 + {if (fp32) 0 else 1}
   *   For sum, D = 2 * ( log2(N) + {if (fp32) 0 else 1} )
   */
-package race.vpu.exu.laneexu.fp
+package race.vpu.exu.crosslane.fp
 
 import chisel3._
 import chisel3.util._
 import race.vpu._
+import race.vpu.exu.laneexu.fp._
 
 object MinMaxFP {
   def apply(a: UInt, b: UInt, isMax: Bool): UInt = {
@@ -42,12 +43,12 @@ object MinMaxFP {
 }
 
 class VFRedCore(
-  N: Int = 64 // N = VLEN / 32
+  N: Int = 64, // N = VLEN / 32
+  ExtendedWidthFp19: Int = 12,
+  ExtendedWidthFp32: Int = 12
 ) extends Module {
   val SigWidthFp19 = 10 + 1  // Fixed
   val SigWidthFp32 = 23 + 1  // Fixed
-  val ExtendedWidthFp19 = 12
-  val ExtendedWidthFp32 = 12
   val io = IO(new Bundle {
     val valid_in = Input(Bool())
     val is_bf16, is_fp16, is_fp32 = Input(Bool())
@@ -55,9 +56,9 @@ class VFRedCore(
     val vs2 = Input(Vec(N, UInt(32.W)))
     val resSum = Output(new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32))
     val resSum_is_posInf, resSum_is_negInf, resSum_is_nan = Output(Bool())
-    val valid_out_Sum = Output(Bool())
+    val valid_out_sum = Output(Bool())
     val resMinMax = Output(UInt(32.W))
-    val valid_out_MinMax = Output(Bool())
+    val valid_out_minmax = Output(Bool())
   })
 
   require(N > 1 && (N & (N - 1)) == 0, s"N must be a power of 2, but got $N")
@@ -244,7 +245,7 @@ class VFRedCore(
   io.resSum_is_posInf := fp32_adderTree_out_info(0).is_posInf
   io.resSum_is_negInf := fp32_adderTree_out_info(0).is_negInf
   io.resSum_is_nan := fp32_adderTree_out_info(0).is_nan
-  io.valid_out_Sum := fp32_adderTree_out_valid
+  io.valid_out_sum := fp32_adderTree_out_valid
 
   //----------------------------------
   //  Min/Max Tree
@@ -304,7 +305,7 @@ class VFRedCore(
   // Output the final MIN/MAX result (already registered)
   //---------------------------------
   io.resMinMax := fp32_minMaxTree_out(0)
-  io.valid_out_MinMax := fp32_minMaxTree_out_valid
+  io.valid_out_minmax := fp32_minMaxTree_out_valid
 }
 
 object VerilogVFRedCore extends App {
