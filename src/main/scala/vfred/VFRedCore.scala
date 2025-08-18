@@ -103,6 +103,7 @@ class VFRedCore(
   val fp19_res_is_negInf = Wire(Vec(N, Bool()))
   val fp19_res_is_nan = Wire(Vec(N, Bool()))
   val fp19_res_valid = Wire(Bool())
+  val fp19_res_is_fp16 = Wire(Bool())
   for (i <- 0 until N) {
     val fadd_extSig_fp19 = Module(new FAdd_extSig(ExpWidth = 8, SigWidth = SigWidthFp19, ExtendedWidth = ExtendedWidthFp19, ExtAreZeros = true, UseShiftRightJam = false))
     fadd_extSig_fp19.io.valid_in := io.valid_in && is_16 && io.is_sum
@@ -125,8 +126,9 @@ class VFRedCore(
     fp19_res_is_negInf(i) := RegEnable(fadd_extSig_fp19.io.res_is_negInf, fadd_extSig_fp19.io.valid_out)
     fp19_res_is_nan(i) := RegEnable(fadd_extSig_fp19.io.res_is_nan, fadd_extSig_fp19.io.valid_out)
     if (i == 0) { fp19_res_valid := RegNext(fadd_extSig_fp19.io.valid_out, init = false.B) }
+    if (i == 0) { fp19_res_is_fp16 := RegEnable(RegEnable(is_fp16, fadd_extSig_fp19.io.valid_in), fadd_extSig_fp19.io.valid_out)}
   }
-
+  
   //----------------------------------------------------------------------------------
   // If input is fp32, do not use fadd_extSig_fp19, go directly to fp32 addition tree.
   //----------------------------------------------------------------------------------
@@ -156,6 +158,7 @@ class VFRedCore(
     val is_posInf = Bool()
     val is_negInf = Bool()
     val is_nan = Bool()
+    val is_fp16 = Bool()
   }
   val fp32_adderTree_in = Wire(Vec(N, new FpExtFormat(ExpWidth = 8, SigWidth = SigWidthFp32, ExtendedWidth = ExtendedWidthFp32)))
   val fp32_adderTree_in_info = Wire(Vec(N, new InfoFPSpecial()))
@@ -177,6 +180,7 @@ class VFRedCore(
     fp32_adderTree_in_info(i).is_posInf := Mux(fp19_res_valid, fp19_res_is_posInf(i), is_inf_32(i) && !sign_in_32(i))
     fp32_adderTree_in_info(i).is_negInf := Mux(fp19_res_valid, fp19_res_is_negInf(i), is_inf_32(i) && sign_in_32(i))
     fp32_adderTree_in_info(i).is_nan := Mux(fp19_res_valid, fp19_res_is_nan(i), is_nan_32(i))
+    fp32_adderTree_in_info(i).is_fp16 := Mux(fp19_res_valid, fp19_res_is_fp16, false.B)
     fp32_adderTree_in(i).sign := Mux(fp19_res_valid, fp19_res(i).sign, sign_in_32(i))
     fp32_adderTree_in(i).exp := Mux(fp19_res_valid, fp19_res(i).exp, exp_adjust_subnorm_32(i))
     fp32_adderTree_in(i).sig := Mux(fp19_res_valid, fp19_res_sig_19to32(i), sig_adjust_subnorm_32(i))
@@ -195,7 +199,7 @@ class VFRedCore(
     val info_out = Wire(Vec(n/2, new InfoFPSpecial()))
     for (i <- 0 until n/2) {
       adders(i).io.valid_in := valid
-      adders(i).io.is_fp16 := false.B
+      adders(i).io.is_fp16 := info(2*i).is_fp16
       adders(i).io.a.sign := data(2*i).sign
       adders(i).io.a.exp := data(2*i).exp
       adders(i).io.a.sig := data(2*i).sig
@@ -215,6 +219,7 @@ class VFRedCore(
       info_out(i).is_posInf := RegEnable(adders(i).io.res_is_posInf, adders(i).io.valid_out)
       info_out(i).is_negInf := RegEnable(adders(i).io.res_is_negInf, adders(i).io.valid_out)
       info_out(i).is_nan := RegEnable(adders(i).io.res_is_nan, adders(i).io.valid_out)
+      info_out(i).is_fp16 := RegEnable(RegEnable(adders(i).io.is_fp16, adders(i).io.valid_in), adders(i).io.valid_out)
     }
     val valid_out = RegNext(adders(0).io.valid_out, init = false.B)
 

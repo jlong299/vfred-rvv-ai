@@ -25,6 +25,8 @@ class FpInfo(value: UInt, fpType: String) {
   val isZero = exp_is_0 && frac_is_0
   val isInf = exp_is_all1s && frac_is_0
   val isNan = exp_is_all1s && !frac_is_0
+  val isPosInf = isInf && !sign
+  val isNegInf = isInf && sign
 }
 
 class ShiftRightJam(val len: Int) extends Module {

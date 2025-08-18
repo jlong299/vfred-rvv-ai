@@ -54,7 +54,7 @@ class VFRed_16_32 extends Module {
   class DelayChainBundle extends Bundle {
     val data = UInt(32.W)
     val uop = new VUop
-    val sewIn = new SewFpOH
+    val sew = new SewFpOH
     val isSum, isMin, isMax = Bool()
   }
 
@@ -62,7 +62,7 @@ class VFRed_16_32 extends Module {
   delayIn0.valid := io.valid_in
   delayIn0.bits.data := io.vs1
   delayIn0.bits.uop := io.uop
-  delayIn0.bits.sewIn := io.sewIn
+  delayIn0.bits.sew := io.sewIn
   delayIn0.bits.isSum := isSum
   delayIn0.bits.isMin := isMin
   delayIn0.bits.isMax := isMax
@@ -70,9 +70,9 @@ class VFRed_16_32 extends Module {
   val delayIn2 = DelayNWithValid(delayIn1, 1)
 
   val delayIn2Mux = Mux1H(Seq(
-    (delayIn0.valid && delayIn0.bits.sewIn.isFp32) -> delayIn0,
-    (delayIn1.valid && delayIn1.bits.sewIn.is16 && !delayIn1.bits.isSum) -> delayIn1,
-    (delayIn2.valid && delayIn2.bits.sewIn.is16 && delayIn2.bits.isSum) -> delayIn2,
+    (delayIn0.valid && delayIn0.bits.sew.isFp32) -> delayIn0,
+    (delayIn1.valid && delayIn1.bits.sew.is16 && !delayIn1.bits.isSum) -> delayIn1,
+    (delayIn2.valid && delayIn2.bits.sew.is16 && delayIn2.bits.isSum) -> delayIn2,
   ))
 
   val delayMinMax = DelayNWithValid(delayIn2Mux, Delay_core_minmax_fp32)
@@ -83,6 +83,8 @@ class VFRed_16_32 extends Module {
     (delaySum.valid && delaySum.bits.isSum) -> delaySum,
   ))
   assert(delayOut.valid === Mux(delayOut.bits.isSum,  vfredCore.io.valid_out_sum, vfredCore.io.valid_out_minmax), "VFReduction")
+
+  val delayOut_info_f16 = 0.U
 
   //------------------------------
   // Accumlator of min/max result
@@ -100,12 +102,16 @@ class VFRed_16_32 extends Module {
   }.otherwise {
     accMinmaxReg.valid := delayOut.valid && !delayOut.bits.isSum
   }
+  val accMinmaxRes = MinMaxFP(vfredCore.io.resMinMax, accMinmaxIn.bits.data, accMinmaxIn.bits.isMax)
   when (delayOut.valid) {
     accMinmaxReg.bits := accMinmaxIn.bits
-    accMinmaxReg.bits.data := MinMaxFP(vfredCore.io.resMinMax, accMinmaxIn.bits.data, accMinmaxIn.bits.isMax)
+    accMinmaxReg.bits.data := accMinmaxRes
   }
-  accMinmaxIn := Mux(delayOut.bits.uop.uopIdx === 0.U, delayOut, accMinmaxReg)
+  val delayOutMinmax = WireDefault(delayOut)
+  delayOutMinmax.bits.data := Mux(delayOut.bits.sew.isFp32, delayOut.bits.data, delayOut.bits.data(15, 0) ## 0.U(16.W))
+  accMinmaxIn := Mux(delayOut.bits.uop.uopIdx === 0.U, delayOutMinmax, accMinmaxReg)
   val validOutMinmax = accMinmaxReg.valid && accMinmaxReg.bits.uop.uopEnd
+
 
   //--------------------------
   // Accumlator of sum result
@@ -121,10 +127,20 @@ class VFRed_16_32 extends Module {
   //                      \     /
   //                        sum
   //                         |
+  class accSumBundle extends Bundle {
+    val data = new FpExtFormat(ExpWidth = 8, SigWidth = 24, ExtendedWidth = ExtendedWidthFp32)
+    val uop = new VUop
+  }
   val accSumIn = Wire(ValidIO(new DelayChainBundle))
-  val accSumRegEven, accSumRegOdd = Reg(ValidIO(new DelayChainBundle))
+  val accSumRegEven, accSumRegOdd = Reg(ValidIO(new accSumBundle))
   val accAdder = Module(new FAdd_extSig(ExpWidth = 8, SigWidth = 24, ExtendedWidth = ExtendedWidthFp32,
                                         ExtAreZeros = false, UseShiftRightJam = false))
+  accAdder.io.valid_in := delayOut.valid && delayOut.bits.isSum
+  accAdder.io.is_fp16 := delayOut.bits.sew.isFp16
+  accAdder.io.a := vfredCore.io.resSum
+  accAdder.io.a_is_posInf := vfredCore.io.resSum_is_posInf
+  accAdder.io.a_is_negInf := vfredCore.io.resSum_is_negInf
+  accAdder.io.a_is_nan := vfredCore.io.resSum_is_nan
   val uop_accAdderOut = RegEnable(delayOut.bits.uop, delayOut.valid)
   when (reset.asBool) {
     accSumRegEven.valid := false.B
@@ -133,6 +149,23 @@ class VFRed_16_32 extends Module {
     accSumRegEven.valid := accAdder.io.valid_out && !uop_accAdderOut.uopIdx(0)
     accSumRegOdd.valid := accAdder.io.valid_out && uop_accAdderOut.uopIdx(0)
   }
+  when (accAdder.io.valid_out && !uop_accAdderOut.uopIdx(0)) {
+    accSumRegEven.bits.data := accAdder.io.res
+    accSumRegEven.bits.uop := uop_accAdderOut
+  }
+  when (accAdder.io.valid_out && uop_accAdderOut.uopIdx(0)) {
+    accSumRegOdd.bits.data := accAdder.io.res
+    accSumRegOdd.bits.uop := uop_accAdderOut
+  }
+  // accSumIn := Mux(delayOut)
+
+  val finalSumReg = Reg(ValidIO(new accSumBundle))
+  val finalAdder = Module(new FAdd_extSig(ExpWidth = 8, SigWidth = 24, ExtendedWidth = ExtendedWidthFp32,
+                                        ExtAreZeros = false, UseShiftRightJam = false))
+  val uop_finalAdderOut = RegEnable(delayOut.bits.uop, delayOut.valid)
+
+
+
 
 
   io.valid_out := validOutMinmax || true.B
@@ -140,7 +173,7 @@ class VFRed_16_32 extends Module {
     validOutMinmax -> accMinmaxReg.bits.uop,
   ))
   io.vd := Mux1H(Seq(
-    validOutMinmax -> accMinmaxReg.bits.data,
+    validOutMinmax -> Mux(accMinmaxReg.bits.sew.isFp32, accMinmaxReg.bits.data, accMinmaxReg.bits.data.head(16)),
   ))
   io.fflags := 0.U
 }
