@@ -183,13 +183,13 @@ class VFRed_16_32 extends Module {
     accSumRegOdd.valid := accAdder.io.valid_out && uop_accAdderOut.uopIdx(0)
   }
   when (accAdder.io.valid_out && !uop_accAdderOut.uopIdx(0)) {
-    accSumRegEven.bits.data := accAdder.io.res
+    accSumRegEven.bits.data := FpExtRemoveLSB(accAdder.io.res, 1)
     accSumRegEven.bits.uop := uop_accAdderOut
     accSumRegEven.bits.sew := sew_accAdderOut
     accSumRegEven.bits.pInf_nInf_nan := Cat(accAdder.io.res_is_posInf, accAdder.io.res_is_negInf, accAdder.io.res_is_nan)
   }
   when (accAdder.io.valid_out && uop_accAdderOut.uopIdx(0)) {
-    accSumRegOdd.bits.data := accAdder.io.res
+    accSumRegOdd.bits.data := FpExtRemoveLSB(accAdder.io.res, 1)
     accSumRegOdd.bits.uop := uop_accAdderOut
     accSumRegOdd.bits.sew := sew_accAdderOut
     accSumRegOdd.bits.pInf_nInf_nan := Cat(accAdder.io.res_is_posInf, accAdder.io.res_is_negInf, accAdder.io.res_is_nan)
@@ -220,14 +220,14 @@ class VFRed_16_32 extends Module {
     finalSumReg.valid := finalAdder.io.valid_out
   }
   when (finalAdder.io.valid_out) {
-    finalSumReg.bits.data := finalAdder.io.res
+    finalSumReg.bits.data := FpExtRemoveLSB(finalAdder.io.res, 1)
     finalSumReg.bits.uop := uop_finalAdderOut
     finalSumReg.bits.sew := sew_finalAdderOut
     finalSumReg.bits.pInf_nInf_nan := Cat(finalAdder.io.res_is_posInf, finalAdder.io.res_is_negInf, finalAdder.io.res_is_nan)
   }
 
   //----- Rounding of final adder result -----
-  
+
 
 
 

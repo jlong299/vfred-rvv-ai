@@ -42,6 +42,19 @@ object MinMaxFP {
   }
 }
 
+object FpExtRemoveLSB {
+  def apply(fp: FpExtFormat, lsb_tobe_removed: Int): FpExtFormat = {
+    val new_sigExt = fp.sig >> lsb_tobe_removed
+    val res = Wire(new FpExtFormat(fp.exp.getWidth, new_sigExt.getWidth, 0))
+    require(res.exp.getWidth == fp.exp.getWidth, "exp width of FpExtFormat must be the same")
+    require(res.sig.getWidth == fp.sig.getWidth - lsb_tobe_removed, "sig width of FpExtFormat must be reduced by lsb_tobe_removed")
+    res.sign := fp.sign
+    res.exp := fp.exp
+    res.sig := new_sigExt
+    res
+  }
+}
+
 class VFRedCore(
   N: Int = 64, // N = VLEN / 32
   ExtendedWidthFp19: Int = 12,
@@ -213,9 +226,7 @@ class VFRedCore(
       adders(i).io.a_is_nan := info(2*i).is_nan
       adders(i).io.b_is_nan := info(2*i+1).is_nan
 
-      data_out(i).sign := RegEnable(adders(i).io.res.sign, adders(i).io.valid_out)
-      data_out(i).exp := RegEnable(adders(i).io.res.exp, adders(i).io.valid_out)
-      data_out(i).sig := RegEnable(adders(i).io.res.sig(SigWidthFp32 + ExtendedWidthFp32, 1), adders(i).io.valid_out)
+      data_out(i) := RegEnable(FpExtRemoveLSB(adders(i).io.res, 1), adders(i).io.valid_out)
       info_out(i).is_posInf := RegEnable(adders(i).io.res_is_posInf, adders(i).io.valid_out)
       info_out(i).is_negInf := RegEnable(adders(i).io.res_is_negInf, adders(i).io.valid_out)
       info_out(i).is_nan := RegEnable(adders(i).io.res_is_nan, adders(i).io.valid_out)
