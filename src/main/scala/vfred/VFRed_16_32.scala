@@ -28,7 +28,6 @@ class VFRed_16_32 extends Module {
 
   val N = VLEN / 32
   val uop = io.uop
-  val widen = uop.ctrl.widen
   val isSum = uop.ctrl.funct6(2, 1) === "b00".U
   val isMin = uop.ctrl.funct6(2, 1) === "b10".U
   val isMax = uop.ctrl.funct6(1)
@@ -84,7 +83,31 @@ class VFRed_16_32 extends Module {
   ))
   assert(delayOut.valid === Mux(delayOut.bits.isSum,  vfredCore.io.valid_out_sum, vfredCore.io.valid_out_minmax), "VFReduction")
 
-  val delayOut_info_f16 = 0.U
+  val delayOut_info_fp16 = FpInfo(delayOut.bits.data(15, 0), "fp16")
+  val delayOut_info_bf16 = FpInfo(delayOut.bits.data(15, 0), "bf16")
+  val delayOut_info_fp32 = FpInfo(delayOut.bits.data, "fp32")
+  val delayOut_pInf_nInf_nan = Mux1H(Seq(
+    delayOut.bits.sew.isFp16 -> delayOut_info_fp16.pInf_nInf_nan,
+    delayOut.bits.sew.isBf16 -> delayOut_info_bf16.pInf_nInf_nan,
+    delayOut.bits.sew.isFp32 -> delayOut_info_fp32.pInf_nInf_nan,
+  ))
+  // data : when fp/bf16, add zeros to 32 + ext
+  val delayOut_data = Wire(new FpExtFormat(ExpWidth = 8, SigWidth = 24, ExtendedWidth = ExtendedWidthFp32))
+  when (delayOut.bits.sew.isFp32 || delayOut.bits.uop.ctrl.widen) {
+    delayOut_data.sign := delayOut.bits.data(31)
+    delayOut_data.exp := Mux(delayOut_info_fp32.isSubnorm, 1.U, delayOut.bits.data(30, 23))
+    delayOut_data.sig := Mux(delayOut_info_fp32.isSubnorm, 0.U(1.W), 1.U(1.W)) ## delayOut.bits.data(22, 0)
+  }.elsewhen (delayOut.bits.sew.isBf16) {
+    delayOut_data.sign := delayOut.bits.data(15)
+    delayOut_data.exp := Mux(delayOut_info_bf16.isSubnorm, 1.U, delayOut.bits.data(14, 7))
+    delayOut_data.sig := Mux(delayOut_info_bf16.isSubnorm, 0.U(1.W), 1.U(1.W)) ## delayOut.bits.data(6, 0) ##
+                             0.U((16 + ExtendedWidthFp32).W)
+  }.otherwise {
+    delayOut_data.sign := delayOut.bits.data(15)
+    delayOut_data.exp := Mux(delayOut_info_fp16.isSubnorm, 1.U, delayOut.bits.data(14, 10))
+    delayOut_data.sig := Mux(delayOut_info_fp16.isSubnorm, 0.U(1.W), 1.U(1.W)) ## delayOut.bits.data(9, 0) ##
+                             0.U((13 + ExtendedWidthFp32).W)
+  }
 
   //------------------------------
   // Accumlator of min/max result
@@ -130,9 +153,11 @@ class VFRed_16_32 extends Module {
   class accSumBundle extends Bundle {
     val data = new FpExtFormat(ExpWidth = 8, SigWidth = 24, ExtendedWidth = ExtendedWidthFp32)
     val uop = new VUop
+    val sew = new SewFpOH
+    val pInf_nInf_nan = UInt(3.W) // Cat(isPosInf, isNegInf, isNan)
   }
-  val accSumIn = Wire(ValidIO(new DelayChainBundle))
   val accSumRegEven, accSumRegOdd = Reg(ValidIO(new accSumBundle))
+  
   val accAdder = Module(new FAdd_extSig(ExpWidth = 8, SigWidth = 24, ExtendedWidth = ExtendedWidthFp32,
                                         ExtAreZeros = false, UseShiftRightJam = false))
   accAdder.io.valid_in := delayOut.valid && delayOut.bits.isSum
@@ -141,7 +166,15 @@ class VFRed_16_32 extends Module {
   accAdder.io.a_is_posInf := vfredCore.io.resSum_is_posInf
   accAdder.io.a_is_negInf := vfredCore.io.resSum_is_negInf
   accAdder.io.a_is_nan := vfredCore.io.resSum_is_nan
+  accAdder.io.b := Mux(delayOut.bits.uop.uopIdx === 0.U, delayOut_data,
+                   Mux(delayOut.bits.uop.uopIdx === 1.U, 0.U,
+                   Mux(!delayOut.bits.uop.uopIdx(0), accSumRegEven.bits.data, accSumRegOdd.bits.data)))
+  accAdder.io.b_is_posInf := delayOut_pInf_nInf_nan(2)
+  accAdder.io.b_is_negInf := delayOut_pInf_nInf_nan(1)
+  accAdder.io.b_is_nan := delayOut_pInf_nInf_nan(0)
+
   val uop_accAdderOut = RegEnable(delayOut.bits.uop, delayOut.valid)
+  val sew_accAdderOut = RegEnable(delayOut.bits.sew, delayOut.valid)
   when (reset.asBool) {
     accSumRegEven.valid := false.B
     accSumRegOdd.valid := false.B
@@ -152,17 +185,49 @@ class VFRed_16_32 extends Module {
   when (accAdder.io.valid_out && !uop_accAdderOut.uopIdx(0)) {
     accSumRegEven.bits.data := accAdder.io.res
     accSumRegEven.bits.uop := uop_accAdderOut
+    accSumRegEven.bits.sew := sew_accAdderOut
+    accSumRegEven.bits.pInf_nInf_nan := Cat(accAdder.io.res_is_posInf, accAdder.io.res_is_negInf, accAdder.io.res_is_nan)
   }
   when (accAdder.io.valid_out && uop_accAdderOut.uopIdx(0)) {
     accSumRegOdd.bits.data := accAdder.io.res
     accSumRegOdd.bits.uop := uop_accAdderOut
+    accSumRegOdd.bits.sew := sew_accAdderOut
+    accSumRegOdd.bits.pInf_nInf_nan := Cat(accAdder.io.res_is_posInf, accAdder.io.res_is_negInf, accAdder.io.res_is_nan)
   }
-  // accSumIn := Mux(delayOut)
 
   val finalSumReg = Reg(ValidIO(new accSumBundle))
+  val onlyOneUop = accSumRegEven.bits.uop.uopIdx === 0.U && accSumRegEven.bits.uop.uopEnd &&
+                   accSumRegEven.valid
   val finalAdder = Module(new FAdd_extSig(ExpWidth = 8, SigWidth = 24, ExtendedWidth = ExtendedWidthFp32,
                                         ExtAreZeros = false, UseShiftRightJam = false))
-  val uop_finalAdderOut = RegEnable(delayOut.bits.uop, delayOut.valid)
+  finalAdder.io.valid_in := accSumRegEven.valid && accSumRegEven.bits.uop.uopEnd ||
+                            accSumRegOdd.valid && accSumRegOdd.bits.uop.uopEnd
+  finalAdder.io.is_fp16 := accSumRegEven.bits.sew.isFp16
+  finalAdder.io.a := accSumRegEven.bits.data
+  finalAdder.io.a_is_posInf := accSumRegEven.bits.pInf_nInf_nan(2)
+  finalAdder.io.a_is_negInf := accSumRegEven.bits.pInf_nInf_nan(1)
+  finalAdder.io.a_is_nan := accSumRegEven.bits.pInf_nInf_nan(0)
+  finalAdder.io.b := Mux(onlyOneUop, 0.U.asTypeOf(chiselTypeOf(accSumRegOdd.bits.data)), accSumRegOdd.bits.data)
+  finalAdder.io.b_is_posInf := Mux(onlyOneUop, false.B, accSumRegOdd.bits.pInf_nInf_nan(2))
+  finalAdder.io.b_is_negInf := Mux(onlyOneUop, false.B, accSumRegOdd.bits.pInf_nInf_nan(1))
+  finalAdder.io.b_is_nan := Mux(onlyOneUop, false.B, accSumRegOdd.bits.pInf_nInf_nan(0))
+
+  val uop_finalAdderOut = RegEnable(accSumRegEven.bits.uop, finalAdder.io.valid_in)
+  val sew_finalAdderOut = RegEnable(accSumRegEven.bits.sew, finalAdder.io.valid_in)
+  when (reset.asBool) {
+    finalSumReg.valid := false.B
+  }.otherwise {
+    finalSumReg.valid := finalAdder.io.valid_out
+  }
+  when (finalAdder.io.valid_out) {
+    finalSumReg.bits.data := finalAdder.io.res
+    finalSumReg.bits.uop := uop_finalAdderOut
+    finalSumReg.bits.sew := sew_finalAdderOut
+    finalSumReg.bits.pInf_nInf_nan := Cat(finalAdder.io.res_is_posInf, finalAdder.io.res_is_negInf, finalAdder.io.res_is_nan)
+  }
+
+  //----- Rounding of final adder result -----
+  
 
 
 

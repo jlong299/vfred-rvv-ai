@@ -13,8 +13,8 @@ class FpInfo(value: UInt, fpType: String) {
     case _ => throw new Exception("Invalid fpType case")
   }
   require(value.getWidth == 1 + expWidth + fracWidth, "Invalid value width")
-  private val exp = value.head(1 + expWidth).tail(1)
-  private val frac = value(fracWidth - 1, 0)
+  val exp = value.head(1 + expWidth).tail(1)
+  val frac = value(fracWidth - 1, 0)
   val sign = value.head(1).asBool
 
   val exp_is_0 = exp === 0.U
@@ -27,6 +27,7 @@ class FpInfo(value: UInt, fpType: String) {
   val isNan = exp_is_all1s && !frac_is_0
   val isPosInf = isInf && !sign
   val isNegInf = isInf && sign
+  def pInf_nInf_nan = Cat(isPosInf, isNegInf, isNan)
 }
 
 class ShiftRightJam(val len: Int) extends Module {
